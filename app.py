@@ -13,6 +13,8 @@ from langchain.chains import ConversationalRetrievalChain
 from typing import List, Optional
 import os
 import tempfile
+import re
+from typing import List, Tuple
 from PyPDF2 import PdfReader
 from database import SessionLocal
 import models
@@ -32,7 +34,7 @@ genai.configure(api_key=genai_api_key)
 # Constants for JWT
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 # App setup
 app = FastAPI()
@@ -129,29 +131,146 @@ def signup(user: UserCreate, db: Session = Depends(get_db)):
     db.refresh(db_user)
     return db_user
 
-@app.post("/login", response_model=Token)
+
+from pydantic import BaseModel
+
+# Define a new response model to include user_id and token details
+class TokenWithUserID(BaseModel):
+    access_token: str
+    token_type: str
+    user_id: int
+
+@app.post("/login", response_model=TokenWithUserID)
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    """Endpoint for user login, returns a JWT token upon successful authentication."""
+    """Endpoint for user login, returns a JWT token and user_id upon successful authentication."""
     user = db.query(User).filter(User.username == form_data.username).first()
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    
+    # Create the access token with username only (no change here)
     token = create_access_token(data={"sub": user.username})
-    return {"access_token": token, "token_type": "bearer"}
+    
+    # Return both the token and user_id
+    return {"access_token": token, "token_type": "bearer", "user_id": user.id}
 
+@app.get("/chat_history", response_model=List[ChatResponse])
+async def chat_history(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Endpoint to retrieve recent chat history for the authenticated user."""
+    history = get_user_chat_history(current_user.username, db)
+    return history
+
+
+# Function to format tables, links, emails, and apply line spacing and paragraph formatting to response text
+def clean_response_text(text: str) -> str:
+    """Removes unwanted characters, applies paragraph formatting, and formats response text with HTML."""
+
+    # Remove special characters like * or /
+    text = re.sub(r"[*/]", "", text).strip()
+    
+    # Add paragraph spacing and line breaks
+    text = re.sub(r"\n\s*\n", "\n\n", text)  # Ensure existing line breaks are spaced correctly
+    text = re.sub(r"(?<!\n)\n(?!\n)", "\n\n", text)  # Convert single newlines to double for paragraph spacing
+
+    # Apply additional formatting for tables, URLs, and email addresses
+    text = format_response(text)
+    
+    # Clean up any extra whitespace
+    return text.strip()
+
+def format_response(response_content: str) -> str:
+    """Formats response content with HTML for tables, links, line breaks, and removes unwanted markdown symbols."""
+    
+    # Check if the content has a table structure and format it
+    if '|' in response_content:
+        response_content = format_table(response_content)
+    
+    # Replace newline characters with HTML line breaks
+    response_content = re.sub(r'\n', ' <br>', response_content)
+    
+    # Format email addresses as mailto links
+    response_content = re.sub(
+        r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)', 
+        r'<a href="mailto:\1">\1</a>', 
+        response_content
+    )
+    
+    # Format URLs as clickable links
+    response_content = re.sub(
+        r'(https?://[^\s]+)', 
+        r'<a href="\1">\1</a>', 
+        response_content
+    )
+    
+    # Format URLs starting with 'www' as clickable links
+    response_content = re.sub(
+        r'\b(www\.[a-zA-Z0-9.-]+\.[a-zA-Z]{2,6}[^\s]*)', 
+        r'<a href="http://\1">\1</a>', 
+        response_content
+    )
+    
+    # Remove unwanted markdown symbols like **, ##, or _ for clean display
+    clean_response = re.sub(r'\*\*|\#\#|\_', '', response_content).strip()
+
+    return clean_response
+
+def format_table(response_content: str) -> str:
+    """Formats any table structure in the response content as an HTML table."""
+    
+    # Split the content into lines, each representing a row in the table
+    rows = response_content.split('\n')
+    
+    # Start building the HTML table
+    table_html = '<table border="1" cellpadding="5" cellspacing="0">'
+    
+    for row in rows:
+        if '|' in row:  # Only format rows with table structure
+            # Split the row into cells using '|' as the delimiter
+            cells = row.split('|')
+            # Clean up whitespace from each cell
+            cells = [cell.strip() for cell in cells if cell.strip()]
+            
+            # Add cells to the table row
+            if cells:
+                table_html += '<tr>'
+                for cell in cells:
+                    table_html += f'<td>{cell}</td>'
+                table_html += '</tr>'
+    
+    table_html += '</table>'
+    
+    return table_html
+
+# Update the chat endpoint with the new clean and formatted response
 @app.post("/chat", response_model=ChatResponse)
 async def chat(chat_request: ChatRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Endpoint for querying the chat system, responding based on previous conversations."""
-    chat_history = get_user_chat_history(current_user.username, db)
-    vector_store = FAISS.load_local("faiss_index", embeddings=GoogleGenerativeAIEmbeddings(api_key=genai_api_key))
+    
+    # Retrieve the user's chat history and ensure it's in the expected format
+    chat_history = get_user_chat_history(current_user.username, db) or []
+    chat_history_formatted: List[Tuple[str, str]] = [(entry['user_text'], entry['bot_reply']) for entry in chat_history]
+    
+    # Load the vector store and conversational chain
+    vector_store = FAISS.load_local(
+        "faiss_index",
+        embeddings=GoogleGenerativeAIEmbeddings(model="models/embedding-001"),
+        allow_dangerous_deserialization=True
+    )
     chain = get_conversational_chain(vector_store)
     
-    response = chain.invoke({"question": chat_request.question, "chat_history": chat_history})
+    # Invoke the conversational chain with the formatted chat history
+    response = chain.invoke({"question": chat_request.question, "chat_history": chat_history_formatted})
     reply = response.get("answer", "Sorry, I couldn't fetch the response.")
-
-    chat = Chat(username=current_user.username, user_text=chat_request.question, bot_reply=reply)
+    
+    # Clean and format the reply text
+    cleaned_reply = clean_response_text(reply)
+    
+    # Store the new chat entry in the database with the cleaned reply
+    chat = Chat(username=current_user.username, user_text=chat_request.question, bot_reply=cleaned_reply)
     db.add(chat)
     db.commit()
-    return ChatResponse(question=chat_request.question, answer=reply)
+    
+    # Return the cleaned and formatted chat response
+    return ChatResponse(question=chat_request.question, answer=cleaned_reply)
 
 @app.post("/upload_documents/", response_model=dict)
 async def upload_documents(
