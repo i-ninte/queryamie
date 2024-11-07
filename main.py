@@ -12,6 +12,7 @@ from langchain_community.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
 from typing import List, Optional
 import os
+from email_utils import send_email
 import tempfile
 import re
 from typing import List, Tuple
@@ -99,6 +100,20 @@ def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_
         raise credentials_exception
     return user
 
+def create_password_reset_token(email: str):
+    to_encode = {"sub": email, "exp": datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)}
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def verify_password_reset_token(token: str):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload.get("sub")
+    except JWTError:
+        return None
+
+
+
 # Function to retrieve user chat history
 def get_user_chat_history(username: str, db: Session, limit: int = 10) -> List[dict]:
     """Fetches the recent chat history for a given user."""
@@ -111,8 +126,53 @@ def get_user_chat_history(username: str, db: Session, limit: int = 10) -> List[d
     )
     return [{"user_text": chat.user_text, "bot_reply": chat.bot_reply} for chat in reversed(chat_history)]
 
-# Endpoints
 
+
+
+
+# Forgot Password Endpoint
+@app.post("/forgot-password")
+async def forgot_password(email: str, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    token = create_password_reset_token(email)
+    reset_link = f"http://queryamie.vercel.app/ResetPassword?token={token}"
+
+    send_email(
+        to_email=email,
+        subject="Password Reset Request",
+        body=f"Please click the following link to reset your password: {reset_link}"
+    )
+    return {"message": "Password reset link sent to your email"}
+
+from pydantic import BaseModel
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+
+
+# Reset Password Endpoint
+@app.post("/reset-password")
+async def reset_password(request: ResetPasswordRequest, db: Session = Depends(get_db)):
+    email = verify_password_reset_token(request.token)
+    if not email:
+        raise HTTPException(status_code=400, detail="Invalid or expired token")
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Set the new hashed password to the correct field
+    hashed_password = get_password_hash(request.new_password)
+    user.hashed_password = hashed_password
+    db.commit()
+    return {"message": "Password reset successful"}
+
+#sign up endpoint
 @app.post("/signup", response_model=UserResponse)
 def signup(user: UserCreate, db: Session = Depends(get_db)):
     """Endpoint to register a new user."""
@@ -142,17 +202,21 @@ class TokenWithUserID(BaseModel):
 
 @app.post("/login", response_model=TokenWithUserID)
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    """Endpoint for user login, returns a JWT token and user_id upon successful authentication."""
     user = db.query(User).filter(User.username == form_data.username).first()
-    if not user or not verify_password(form_data.password, user.hashed_password):
+    
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+
+    # Verify password with the correct hashed password field
+    if not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     
-    # Create the access token with username only (no change here)
+    # Create and return the access token
     token = create_access_token(data={"sub": user.username})
-    
-    # Return both the token and user_id
     return {"access_token": token, "token_type": "bearer", "user_id": user.id}
 
+
+# Define a new endpoint to retrieve user details
 @app.get("/chat_history", response_model=List[ChatResponse])
 async def chat_history(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """Endpoint to retrieve recent chat history for the authenticated user."""
